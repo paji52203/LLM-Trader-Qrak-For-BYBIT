@@ -1,0 +1,696 @@
+"""
+Crypto Trading Bot - Entry Point
+Automated trading with AI-powered decisions.
+"""
+# --- Standard Library ---
+import asyncio
+import atexit
+import os
+import sys
+import time
+import warnings
+from pathlib import Path
+from typing import Optional
+
+# --- Third-party ---
+import aiohttp
+import torch  # noqa: F401  # needed to initialize PyTorch before sentence-transformers
+import chromadb
+
+# --- Local ---
+from src.config.loader import config
+from src.app import CryptoTradingBot
+from sentence_transformers import SentenceTransformer
+from src.logger.logger import Logger
+from src.utils.graceful_shutdown_manager import GracefulShutdownManager
+from src.platforms.alternative_me import AlternativeMeAPI
+from src.platforms.defillama import DefiLlamaClient
+from src.platforms.coingecko import CoinGeckoAPI
+from src.platforms.cryptocompare.news_client import CryptoCompareNewsClient
+from src.platforms.cryptocompare.market_api import CryptoCompareMarketAPI
+from src.platforms.cryptocompare.categories_api import CryptoCompareCategoriesAPI
+from src.platforms.cryptocompare.data_processor import CryptoCompareDataProcessor
+from src.platforms.exchange_manager import ExchangeManager
+from src.platforms.bybit_websocket import BybitWebSocketManager
+from src.analyzer.analysis_engine import AnalysisEngine
+from src.rag import RagEngine
+from src.utils.token_counter import TokenCounter, CostStorage, ModelPricing
+from src.utils.format_utils import FormatUtils
+from src.managers.model_manager import ModelManager, ProviderClients, ProviderOrchestrator
+from src.factories import ProviderFactory
+from src.managers.persistence_manager import PersistenceManager
+from src.managers.risk_manager import RiskManager
+from src.trading import (
+    TradingStrategy, TradingBrainService,
+    TradingStatisticsService, TradingMemoryService, PositionExtractor
+)
+from src.trading.vector_memory import VectorMemoryService
+from src.dashboard.server import DashboardServer
+from src.notifiers import DiscordNotifier, ConsoleNotifier
+from src.utils.keyboard_handler import KeyboardHandler
+from src.parsing.unified_parser import UnifiedParser
+from src.factories import TechnicalIndicatorsFactory, DataFetcherFactory
+from src.rag.article_processor import ArticleProcessor
+from src.rag.collision_resolver import CategoryCollisionResolver
+from src.analyzer.pattern_engine import PatternEngine
+from src.analyzer.pattern_engine.indicator_patterns import IndicatorPatternEngine
+from src.analyzer.formatters import (
+    MarketOverviewFormatter,
+    LongTermFormatter,
+    MarketFormatter,
+    MarketPeriodFormatter
+)
+from src.rag import (
+    RagFileHandler, NewsManager, MarketDataManager,
+    IndexManager, ContextBuilder, CategoryFetcher,
+    CategoryProcessor, TickerManager, NewsCategoryAnalyzer
+)
+from src.rag.market_components import (
+    MarketDataFetcher,
+    MarketDataProcessor,
+    MarketDataCache,
+    MarketOverviewBuilder
+)
+from src.analyzer import (
+    TechnicalCalculator, PatternAnalyzer, MarketDataCollector,
+    MarketMetricsCalculator, AnalysisResultProcessor,
+    TechnicalFormatter
+)
+from src.analyzer.prompts import PromptBuilder
+from src.analyzer.prompts.template_manager import TemplateManager
+from src.analyzer.prompts.context_builder import ContextBuilder as AnalyzerContextBuilder
+from src.analyzer.pattern_engine import ChartGenerator
+from src.utils.timeframe_validator import TimeframeValidator
+
+# Suppress known deprecation warnings from third-party libraries at runtime
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="docopt")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="discord")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="google.genai")
+
+
+def _get_best_device() -> str:
+    """Auto-detect best available hardware accelerator for embeddings.
+
+    Priority: CUDA (NVIDIA) > MPS (Apple Silicon) > CPU.
+    """
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+try:
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+    from PyQt6.QtCore import Qt
+    PYQT_AVAILABLE = True
+except ImportError:
+    PYQT_AVAILABLE = False
+
+class SingleInstanceLock:
+    """Manages a single instance lock file to prevent multiple application instances."""
+
+    def __init__(self, app_name: str = ".llm_trader.lock"):
+        self.lock_file_path = Path.home() / app_name
+        self._lock_handle: Optional[int] = None
+
+    def acquire(self) -> bool:
+        """Attempt to acquire the lock. Returns True if successful."""
+        try:
+            self._lock_handle = os.open(str(self.lock_file_path), os.O_CREAT | os.O_RDWR)
+
+            if sys.platform == "win32":
+                import msvcrt
+                try:
+                    msvcrt.locking(self._lock_handle, msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    return False
+            else:
+                import fcntl  # pylint: disable=import-error
+                try:
+                    fcntl.flock(self._lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return False
+
+            atexit.register(self.release)
+            return True
+
+        except Exception as e:
+            print(f"Warning: Could not create lock file: {e}")
+            return True
+
+    def release(self) -> None:
+        """Release the lock and cleanup."""
+        if self._lock_handle is not None:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    msvcrt.locking(self._lock_handle, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl  # pylint: disable=import-error
+                    fcntl.flock(self._lock_handle, fcntl.LOCK_UN)
+                os.close(self._lock_handle)
+            except Exception:
+                pass
+            self._lock_handle = None
+
+            try:
+                self.lock_file_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+class CompositionRoot:
+    """Composition Root for the trading bot application.
+
+    Responsible for building and wiring all dependencies following the
+    Dependency Injection pattern before injecting them into CryptoTradingBot.
+    """
+
+    def __init__(self):
+        self.config = config
+        self.logger = Logger(logger_name="Bot", logger_debug=config.LOGGER_DEBUG)
+        self.logger.install_crash_handler()
+        self.loop = None
+        self.shutdown_manager = None
+        self._http_session = None  # Track aiohttp session for proper cleanup
+
+    async def build_dependencies(self) -> dict:
+        """Build all dependencies for the trading bot via segmented provisions."""
+        start_time = time.perf_counter()
+        self.logger.info("Initializing Crypto Trading Bot...")
+
+        self._init_directories()
+        infra = await self._provision_infrastructure()
+        utils = self._provision_utilities()
+        apis = await self._provision_platforms(infra, utils)
+        rag = await self._provision_rag_layer(infra, apis, utils)
+        models = self._provision_model_layer(utils)
+        analyzer = await self._provision_analyzer_layer(infra, apis, utils, rag, models)
+        trading = self._provision_trading_layer(infra, utils)
+        notifiers = await self._provision_notifiers(utils)
+
+        end_time = time.perf_counter()
+        init_duration = end_time - start_time
+        self.logger.info("All dependencies initialized successfully in %.2f seconds", init_duration)
+
+        # Exclude DashboardServer from deps since it will be managed separately now
+        deps = {
+            'exchange_manager': infra['exchange_manager'],
+            'market_analyzer': analyzer['engine'],
+            'trading_strategy': trading['strategy'],
+            'discord_notifier': notifiers['notifier'],
+            'discord_task': notifiers['task'],
+            'keyboard_handler': infra['keyboard_handler'],
+            'rag_engine': rag,
+            'coingecko_api': apis['coingecko'],
+            'news_client': apis['news'],
+            'market_api': apis['market'],
+            'categories_api': apis['categories'],
+            'alternative_me_api': apis['alternative_me'],
+            'cryptocompare_session': infra['session'],
+            'persistence': trading['persistence'],
+            'model_manager': models['manager'],
+            'brain_service': trading['brain_service'],
+            'statistics_service': trading['statistics_service'],
+            'memory_service': trading['memory_service'],
+            'unified_parser': utils['parser']
+        }
+
+        return deps
+
+    def _init_directories(self):
+        """Ensure all required directories exist."""
+        data_dir = self.config.DATA_DIR
+        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(os.path.join(data_dir, "news_cache"), exist_ok=True)
+        os.makedirs(os.path.join(data_dir, "trading"), exist_ok=True)
+        os.makedirs(os.path.join(data_dir, "charts"), exist_ok=True)
+
+        # Calculate symbol-specific brain dir
+        safe_symbol = self.config.CRYPTO_PAIR.replace("/", "_").replace("-", "_")
+        brain_dir = os.path.join(data_dir, "trading", f"brain_{safe_symbol}_{self.config.TIMEFRAME}")
+        os.makedirs(brain_dir, exist_ok=True)
+
+    async def _provision_infrastructure(self) -> dict:
+        """Provision base infrastructure components."""
+        exchange_manager = ExchangeManager(logger=self.logger, config=self.config)
+        await exchange_manager.initialize()
+
+        session = aiohttp.ClientSession()
+        self._http_session = session  # Store reference for cleanup on shutdown
+        keyboard_handler = KeyboardHandler(logger=self.logger)
+
+        return {
+            'exchange_manager': exchange_manager,
+            'session': session,
+            'keyboard_handler': keyboard_handler
+        }
+
+    def _provision_utilities(self) -> dict:
+        """Provision utility singletons."""
+        format_utils = FormatUtils()
+        parser = UnifiedParser(self.logger, format_utils=format_utils)
+        token_counter = TokenCounter()
+        # SentenceSplitter removed (simplified NLP)
+        ti_factory = TechnicalIndicatorsFactory()
+        timeframe_validator = TimeframeValidator()
+        data_fetcher_factory = DataFetcherFactory(self.logger)
+        collision_resolver = CategoryCollisionResolver()
+
+        return {
+            'format_utils': format_utils,
+            'parser': parser,
+            'token_counter': token_counter,
+            # 'sentence_splitter': sentence_splitter, # Removed
+            'ti_factory': ti_factory,
+            'timeframe_validator': timeframe_validator,
+            'data_fetcher_factory': data_fetcher_factory,
+            'collision_resolver': collision_resolver
+        }
+
+    async def _provision_platforms(self, infra: dict, utils: dict) -> dict:
+        """Provision external API clients."""
+        from aiohttp_client_cache import SQLiteBackend
+        coingecko_backend = SQLiteBackend(cache_name='cache/coingecko_cache.db', expire_after=-1)
+
+        coingecko = CoinGeckoAPI(
+            logger=self.logger,
+            cache_backend=coingecko_backend,
+            cache_dir='data/market_data',
+            api_key=self.config.COINGECKO_API_KEY,
+            update_interval_hours=24,
+            global_api_url=self.config.RAG_COINGECKO_GLOBAL_API_URL
+        )
+        await coingecko.initialize()
+
+        news_client = CryptoCompareNewsClient(self.logger, self.config)
+
+        cc_data_processor = CryptoCompareDataProcessor(self.logger)
+        categories = CryptoCompareCategoriesAPI(
+            logger=self.logger, config=self.config, data_processor=cc_data_processor,
+            collision_resolver=utils['collision_resolver'],
+            data_dir='data', categories_update_interval_hours=self.config.RAG_CATEGORIES_UPDATE_INTERVAL_HOURS
+        )
+        await categories.initialize()
+
+        defillama = DefiLlamaClient(
+            logger=self.logger, session=infra['session'], cache_dir='cache',
+            update_interval_hours=self.config.RAG_DEFILLAMA_UPDATE_INTERVAL_HOURS
+        )
+
+        alternative_me = AlternativeMeAPI(logger=self.logger)
+        await alternative_me.initialize()
+
+        return {
+            'coingecko': coingecko,
+            'news': news_client,
+            'market': CryptoCompareMarketAPI(logger=self.logger, config=self.config),
+            'categories': categories,
+            'defillama': defillama,
+            'alternative_me': alternative_me
+        }
+
+    async def _provision_rag_layer(self, infra: dict, apis: dict, utils: dict) -> RagEngine:
+        """Provision the RAG (Retrieval Augmented Generation) engine."""
+        article_processor = ArticleProcessor(
+            logger=self.logger, unified_parser=utils['parser'],
+            format_utils=utils['format_utils']
+        )
+
+        file_handler = RagFileHandler(logger=self.logger, config=self.config, unified_parser=utils['parser'])
+        news_manager = NewsManager(
+            logger=self.logger, file_handler=file_handler, news_client=apis['news'],
+            categories_api=apis['categories'], session=infra['session'], article_processor=article_processor
+        )
+
+        marker_fetcher = MarketDataFetcher(
+            self.logger, apis['coingecko'], infra['exchange_manager'], apis['market'], apis['defillama']
+        )
+        market_processor = MarketDataProcessor(self.logger, utils['parser'])
+        data_manager = MarketDataManager(
+            self.logger, file_handler, apis['coingecko'], apis['market'],
+            infra['exchange_manager'], unified_parser=utils['parser'],
+            fetcher=marker_fetcher, processor=market_processor,
+            cache=MarketDataCache(self.logger, file_handler),
+            overview_builder=MarketOverviewBuilder(self.logger, market_processor)
+        )
+
+        category_processor = CategoryProcessor(self.logger, utils['collision_resolver'], file_handler)
+        engine = RagEngine(
+            logger=self.logger, token_counter=utils['token_counter'], config=self.config,
+            coingecko_api=apis['coingecko'], exchange_manager=infra['exchange_manager'],
+            file_handler=file_handler, news_manager=news_manager, market_data_manager=data_manager,
+            index_manager=IndexManager(self.logger, article_processor),
+            category_fetcher=CategoryFetcher(self.logger, apis['categories']),
+            category_processor=category_processor,
+            ticker_manager=TickerManager(self.logger, file_handler, infra['exchange_manager']),
+            news_category_analyzer=NewsCategoryAnalyzer(self.logger, category_processor, utils['parser']),
+            context_builder=ContextBuilder(self.logger, utils['token_counter'], self.config, article_processor)
+        )
+        await engine.initialize()
+        return engine
+
+    def _provision_model_layer(self, utils: dict) -> dict:
+        """Provision AI model managers and providers."""
+        provider_factory = ProviderFactory(self.logger, self.config)
+        provider_clients = ProviderClients.from_factory_dict(provider_factory.create_all_clients())
+        orchestrator = ProviderOrchestrator(self.logger, self.config, provider_clients)
+
+        manager = ModelManager(
+            logger=self.logger, config=self.config, unified_parser=utils['parser'],
+            token_counter=utils['token_counter'], cost_storage=CostStorage(),
+            model_pricing=ModelPricing(), orchestrator=orchestrator, provider_clients=provider_clients
+        )
+
+        return {'manager': manager}
+
+    async def _provision_analyzer_layer(
+        self, infra: dict, apis: dict, utils: dict, rag: RagEngine, models: dict
+    ) -> dict:
+        """Provision the market analysis engine."""
+        overview_fmt = MarketOverviewFormatter(self.logger, utils['format_utils'])
+        long_term_fmt = LongTermFormatter(self.logger, utils['format_utils'])
+        period_fmt = MarketPeriodFormatter(self.logger, utils['format_utils'])
+
+        market_fmt = MarketFormatter(
+            self.logger, utils['format_utils'], self.config, utils['token_counter'],
+            overview_fmt, period_fmt, long_term_fmt
+        )
+
+        tech_calc = TechnicalCalculator(self.logger, utils['format_utils'], utils['ti_factory'])
+        pattern_analyzer = PatternAnalyzer(
+            pattern_engine=PatternEngine(lookback=5, lookahead=5),
+            indicator_pattern_engine=IndicatorPatternEngine(),
+            logger=self.logger
+        )
+        try:
+            pattern_analyzer.warmup()
+        except Exception as warmup_error:
+            self.logger.warning("Pattern analyzer warm-up could not run: %s", warmup_error)
+
+        ctx_builder = AnalyzerContextBuilder(
+            self.config.TIMEFRAME, self.logger, utils['format_utils'],
+            market_fmt, period_fmt, long_term_fmt, utils['timeframe_validator']
+        )
+        
+        prompt_builder = PromptBuilder(
+            self.config.TIMEFRAME, self.logger, tech_calc, self.config, utils['format_utils'],
+            overview_fmt, long_term_fmt, TechnicalFormatter(tech_calc, self.logger, utils['format_utils']),
+            market_fmt, utils['timeframe_validator'],
+            TemplateManager(self.config, self.logger, utils['timeframe_validator']), ctx_builder
+        )
+        
+        engine = AnalysisEngine(
+            self.logger, rag, apis['coingecko'], models['manager'], apis['alternative_me'],
+            apis['market'], self.config, tech_calc, pattern_analyzer, prompt_builder,
+            MarketDataCollector(self.logger, rag, apis['alternative_me'], session=infra['session']),
+            MarketMetricsCalculator(self.logger),
+            AnalysisResultProcessor(models['manager'], self.logger, utils['parser']),
+            ChartGenerator(
+                self.logger, self.config, formatter=utils['format_utils'].fmt, format_utils=utils['format_utils']
+            ),
+            data_fetcher_factory=utils['data_fetcher_factory']
+        )
+        
+        return {'engine': engine}
+
+    def _provision_trading_layer(self, infra: dict, utils: dict) -> dict:
+        """Provision trading strategy and memory services."""
+        persistence = PersistenceManager(self.logger, data_dir="data/trading")
+        risk_manager = RiskManager(self.logger, self.config)
+
+        # Calculate specialized brain path
+        safe_symbol = self.config.CRYPTO_PAIR.replace("/", "_").replace("-", "_")
+        brain_path = os.path.join(self.config.DATA_DIR, "trading", f"brain_{safe_symbol}_{self.config.TIMEFRAME}")
+
+        # Create symbol-specific chroma client
+        chroma_client = chromadb.PersistentClient(path=brain_path)
+
+        # Auto-detect best hardware accelerator; log for observability
+        embed_device = _get_best_device()
+        self.logger.info("Embedding device: %s", embed_device)
+        embedding_model = SentenceTransformer("BAAI/bge-small-en-v1.5", device=embed_device)
+
+        # Inject chroma_client into VectorMemoryService
+        vector_memory = VectorMemoryService(self.logger, chroma_client, embedding_model=embedding_model)
+        
+        brain_service = TradingBrainService(
+            self.logger, persistence, vector_memory
+        )
+        
+        memory_service = TradingMemoryService(self.logger, persistence, max_memory=10, vector_memory=vector_memory)
+        statistics_service = TradingStatisticsService(self.logger, persistence)
+        
+        # Real-time Price Provider (Bybit WebSocket)
+        bybit_ws = None
+        if "bybit" in self.config.SUPPORTED_EXCHANGES:
+            bybit_ws = BybitWebSocketManager(self.logger, symbol=self.config.CRYPTO_PAIR)
+            bybit_ws.start()
+            
+            # Register for shutdown if shutdown_manager exists
+            if self.shutdown_manager:
+                self.shutdown_manager.register_shutdown_callback(bybit_ws.stop)
+
+        from src.factories.position_factory import PositionFactory
+        strategy = TradingStrategy(
+            self.logger, persistence, brain_service, statistics_service, memory_service,
+            risk_manager, self.config, PositionExtractor(self.logger, utils['parser']),
+            PositionFactory(self.logger),
+            exchange_manager=infra['exchange_manager'],
+            price_provider=bybit_ws
+        )
+        
+        return {
+            'strategy': strategy,
+            'persistence': persistence,
+            'brain_service': brain_service,
+            'memory_service': memory_service,
+            'statistics_service': statistics_service,
+            'bybit_ws': bybit_ws
+        }
+
+    async def _provision_notifiers(self, utils: dict) -> dict:
+        """Provision notification services."""
+        notifier = None
+        task = None
+        
+        if self.config.DISCORD_BOT_ENABLED and hasattr(self.config, 'BOT_TOKEN_DISCORD') and self.config.BOT_TOKEN_DISCORD:
+            try:
+                import discord
+                from src.notifiers.filehandler_components import (
+                    TrackingPersistence, MessageTracker, CleanupScheduler, MessageDeleter
+                )
+                from src.notifiers.filehandler import DiscordFileHandler
+                
+                intents = discord.Intents.default()
+                intents.message_content = False
+                intents.reactions = False
+                intents.typing = False
+                intents.presences = False
+                
+                bot = discord.Client(intents=intents)
+                
+                persistence = TrackingPersistence("data/tracked_messages.json", self.logger)
+                tracker = MessageTracker(persistence, self.logger, self.config)
+                scheduler = CleanupScheduler(7200, self.logger)
+                deleter = MessageDeleter(bot, self.logger)
+                
+                file_handler = DiscordFileHandler(
+                    bot=bot,
+                    logger=self.logger,
+                    config=self.config,
+                    persistence=persistence,
+                    tracker=tracker,
+                    scheduler=scheduler,
+                    deleter=deleter
+                )
+                
+                notifier = DiscordNotifier(
+                    self.logger, self.config, utils['parser'], 
+                    utils['format_utils'], bot, file_handler
+                )
+                
+                task = asyncio.create_task(notifier.start())
+                await notifier.wait_until_ready()
+            except Exception as e:
+                self.logger.warning("Discord initialization failed: %s. Falling back to console output.", e)
+                notifier = ConsoleNotifier(self.logger, self.config, utils['parser'], utils['format_utils'])
+        else:
+            notifier = ConsoleNotifier(self.logger, self.config, utils['parser'], utils['format_utils'])
+            
+        return {'notifier': notifier, 'task': task}
+    
+    async def _start_trading_bot(self):
+        """Build dependencies and start the Heavy AI Trading Bot."""
+        if hasattr(self, '_bot_running') and self._bot_running:
+            return
+
+        self.logger.info("Building heavy Bot Dependencies...")
+        dependencies = await self.build_dependencies()
+        
+        # Inject dependencies back to Dashboard
+        if self.dashboard_server:
+            self.dashboard_server.inject_dependencies({
+                'brain_service': dependencies['brain_service'],
+                'vector_memory': dependencies['brain_service'].vector_memory if dependencies['brain_service'] else None,
+                'analysis_engine': dependencies['market_analyzer'],
+                'unified_parser': dependencies['unified_parser'],
+                'persistence': dependencies['persistence'],
+                'exchange_manager': dependencies['exchange_manager']
+            })
+
+        self.bot = CryptoTradingBot(
+            logger=self.logger,
+            config=self.config,
+            shutdown_manager=self.shutdown_manager,
+            **{k: v for k, v in dependencies.items() if k not in ['unified_parser']}
+        )
+        
+        await self.bot.initialize()
+        symbol = self.config.CRYPTO_PAIR
+        timeframe = self.config.TIMEFRAME
+
+        self._bot_running = True
+        if self.dashboard_server:
+            self.dashboard_server.bot_running = True
+            # Wire reload_callback to force bot re-analysis when settings change
+            if hasattr(self.dashboard_server, 'settings_router_instance'):
+                self.dashboard_server.settings_router_instance.reload_callback = self.bot._force_analysis_now
+            
+        self.bot_task = asyncio.create_task(self.bot.run(symbol, timeframe))
+        self.logger.info("Bot logic successfully started and engaged.")
+
+    async def _stop_trading_bot(self):
+        """Stop the heavy AI Trading Bot but leave Dashboard alive."""
+        if not hasattr(self, '_bot_running') or not self._bot_running:
+            return
+            
+        self.logger.info("Stopping Bot Logic...")
+        if hasattr(self, 'bot_task') and self.bot_task:
+            self.bot_task.cancel()
+            try:
+                await self.bot_task
+            except asyncio.CancelledError:
+                pass
+            
+        self._bot_running = False
+        if self.dashboard_server:
+            self.dashboard_server.bot_running = False
+        self.logger.info("Bot logic successfully stopped.")
+
+    async def run_async(self):
+        """Async entry point for the application. Starts the Dashboard first."""
+        def _asyncio_exception_handler(loop, context):
+            exc = context.get("exception")
+            msg = context.get("message", "Unknown asyncio error")
+            if exc is not None:
+                if isinstance(exc, KeyboardInterrupt):
+                    self.logger.debug("Asyncio task KeyboardInterrupt during shutdown: %s", msg)
+                    return
+                self.logger.error("Asyncio unhandled exception: %s", msg, exc_info=exc)
+            else:
+                self.logger.error("Asyncio error: %s", msg)
+
+        if self.loop:
+            self.loop.set_exception_handler(_asyncio_exception_handler)
+
+        self.logger.info("Initializing Light Dashboard Server...")
+        self._init_directories()
+        
+        self.dashboard_server = DashboardServer(
+            brain_service=None,
+            vector_memory=None,
+            analysis_engine=None,
+            config=self.config,
+            logger=self.logger,
+            unified_parser=None,
+            persistence=None,
+            exchange_manager=None,
+            host=self.config.DASHBOARD_HOST,
+            port=self.config.DASHBOARD_PORT
+        )
+        self.dashboard_server.bot_start_callback = self._start_trading_bot
+        self.dashboard_server.bot_stop_callback = self._stop_trading_bot
+        self._bot_running = False
+
+        try:
+            # Auto-start dashboard
+            # We don't respect DASHBOARD_ENABLED=False here because it IS the entry point now.
+            await self.dashboard_server.start()
+            print(">>> DASHBOARD IS NOW LIVE ON PORT 8000 <<<")
+            
+            # Create a simple keyboard handler since the bot's isn't initialized yet
+            from src.utils.keyboard_handler import KeyboardHandler
+            kb_handler = KeyboardHandler(self.logger)
+            kb_handler.register_command('h', lambda: print("Press 'q' to quit"), "Help")
+            kb_handler.register_command('q', lambda: os.kill(os.getpid(), 2), "Quit")
+            
+            self.logger.info("System Ready. Auto-starting AI Engine in background...")
+            
+            # Auto-start bot di background agar dashboard tidak terblokir
+            asyncio.create_task(self._start_trading_bot())
+            
+            # Keep alive loop
+            while True:
+                await asyncio.sleep(1)
+
+        except asyncio.CancelledError:
+            self.logger.info("Process cancelled, shutting down...")
+        finally:
+            await self._stop_trading_bot()
+            if hasattr(self, 'dashboard_server') and self.dashboard_server:
+                await self.dashboard_server.stop()
+            # Close aiohttp session cleanly to prevent 'Unclosed client session' errors
+            if self._http_session and not self._http_session.closed:
+                await self._http_session.close()
+    
+    def start(self):
+        """Main entry point with clean shutdown delegation."""
+        # Initialize lock manager
+        single_instance_lock = SingleInstanceLock()
+        
+        if not single_instance_lock.acquire():
+            if PYQT_AVAILABLE:
+                app = QApplication.instance()
+                if app is None:
+                    app = QApplication(sys.argv)
+                    QApplication.setHighDpiScaleFactorRoundingPolicy(
+                        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+                    )
+                QMessageBox.critical(
+                    None,
+                    "Crypto Trading Bot",
+                    "Another instance of Crypto Trading Bot is already running.",
+                    QMessageBox.StandardButton.Ok
+                )
+            else:
+                print("Another instance of Crypto Trading Bot is already running.")
+            sys.exit(1)
+        
+        if sys.platform == 'win32':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        
+        self.shutdown_manager = GracefulShutdownManager(
+            self.loop,
+            logger=self.logger,
+            confirmation_callback=GracefulShutdownManager.show_exit_confirmation
+        )
+        self.shutdown_manager.setup_signal_handlers()
+        
+        try:
+            self.loop.run_until_complete(self.run_async())
+        except KeyboardInterrupt:
+            print("\nKeyboardInterrupt received - initiating graceful shutdown...")
+            self.loop.run_until_complete(self.shutdown_manager.shutdown_gracefully())
+        except Exception:
+            self.logger.exception("Unhandled exception in main loop — shutting down")
+            self.loop.run_until_complete(self.shutdown_manager.shutdown_gracefully())
+        finally:
+            self.loop.close()
+
+
+if __name__ == "__main__":
+    CompositionRoot().start()
