@@ -29,7 +29,6 @@ class TradingStrategy:
         position_extractor=None,
         position_factory=None,
         exchange_manager=None,
-        price_provider=None,
     ):
         """Initialize the trading strategy with DI pattern.
 
@@ -54,7 +53,6 @@ class TradingStrategy:
         self.extractor = position_extractor
         self.position_factory = position_factory
         self.exchange_manager = exchange_manager
-        self.price_provider = price_provider
 
         # Load any existing position
         self.current_position: Optional[Position] = self.persistence.load_position()
@@ -109,11 +107,13 @@ class TradingStrategy:
         # LIVE EXECUTION CLOSURE
         if self.exchange_manager and self.current_position:
             try:
-                exchange_id = self.config.SUPPORTED_EXCHANGES[0] if self.config.SUPPORTED_EXCHANGES else "bybit"
-                if self.current_position.direction == "LONG":
-                    await self.exchange_manager.create_market_sell_order(exchange_id, self.current_position.symbol, self.current_position.size)
-                else:
-                    await self.exchange_manager.create_market_buy_order(exchange_id, self.current_position.symbol, self.current_position.size)
+                await self.exchange_manager.close_futures_position(
+                    "bybit", 
+                    self.current_position.symbol, 
+                    self.current_position.direction, 
+                    self.current_position.size,
+                    current_price=current_price
+                )
             except Exception as e:
                 self.logger.error("Failed to close live order: %s", e)
 
@@ -337,28 +337,18 @@ class TradingStrategy:
         direction = "LONG" if signal == "BUY" else "SHORT"
         market_conditions = market_conditions or {}
 
-        # Calculate quantity based on REAL LIVE exchange capital if available
-        exchange_id = self.config.SUPPORTED_EXCHANGES[0] if self.config.SUPPORTED_EXCHANGES else "bybit"
-        
-        # Check for API keys in configured exchange
-        has_keys = False
-        if exchange_id == "tokocrypto":
-            has_keys = bool(self.config.TOKOCRYPTO_API_KEY)
-        elif exchange_id == "bybit":
-            has_keys = bool(self.config.BYBIT_API_KEY)
-        elif exchange_id == "indodax":
-            has_keys = bool(self.config.INDODAX_API_KEY)
-
-        if self.exchange_manager and has_keys:
-            capital = await self.exchange_manager.fetch_wallet_balance(exchange_id, self.config.QUOTE_CURRENCY)
-            self.logger.critical("Using real LIVE %s capital: $%s %s", exchange_id, f"{capital:,.2f}", self.config.QUOTE_CURRENCY)
+        # Calculate quantity based on REAL LIVE Bybit capital if available
+        if self.exchange_manager and hasattr(self.config, 'BYBIT_API_KEY') and self.config.BYBIT_API_KEY:
+            capital = await self.exchange_manager.fetch_available_margin("bybit", self.config.QUOTE_CURRENCY)
+            self.logger.critical("Using real LIVE Bybit Margin: $%s %s", f"{capital:,.2f}", self.config.QUOTE_CURRENCY)
             if capital <= 0:
-                self.logger.warning("Live capital is zero or failed to fetch. Falling back to paper capital.")
-                capital = self.statistics_service.get_current_capital(self.config.DEMO_QUOTE_CAPITAL)
+                self.logger.warning("Live margin is zero or failed to fetch. Cannot execute real trade!")
+                return None
         else:
             capital = self.statistics_service.get_current_capital(self.config.DEMO_QUOTE_CAPITAL)
 
-        # 1. Dynamic Parameter Calculation from RiskManager
+        # Remove AGGRESSIVE MODE: Use AI Risk Assessment Sizing
+        # Delegate Risk Calculation to RiskManager
         risk_assessment = self.risk_manager.calculate_entry_parameters(
             signal=signal,
             current_price=current_price,
@@ -366,13 +356,9 @@ class TradingStrategy:
             confidence=confidence,
             stop_loss=stop_loss,
             take_profit=take_profit,
-            position_size=position_size,
+            position_size=None,
             market_conditions=market_conditions
         )
-
-        if risk_assessment.quantity <= 0:
-            self.logger.warning("Aborting trade: RiskManager returned zero quantity (likely due to Fee-Awareness or risk limits)")
-            return None
 
         final_sl = risk_assessment.stop_loss
         final_tp = risk_assessment.take_profit
@@ -382,19 +368,17 @@ class TradingStrategy:
         sl_distance_pct = risk_assessment.sl_distance_pct
         tp_distance_pct = risk_assessment.tp_distance_pct
         rr_ratio = risk_assessment.rr_ratio
+        
+        # Use dynamic leverage from risk assessment
+        leverage = getattr(risk_assessment, "leverage", 10)
 
-        self.logger.info("Position sizing: Capital=$%s, Size=%.2f%%, Allocation=$%s, Leverage=%sx, Quantity=%.6f", 
-                         f"{capital:,.2f}", final_size_pct * 100, f"{risk_assessment.quote_amount:,.2f}", 
-                         risk_assessment.leverage, quantity)
-        
-        # Mandatory ROI Projection Logging
-        self.logger.critical(
-            f"ROI Projection: {risk_assessment.net_roi:+.2f}% (with {risk_assessment.leverage}x leverage) | "
-            f"Est. Fees: {(risk_assessment.entry_fee/risk_assessment.quote_amount)*100:.3f}% | "
-            f"Net: {risk_assessment.net_roi:+.2f}%"
-        )
-        
-        self.logger.info("Risk metrics: SL=%.2f%%, TP=%.2f%%, R/R=%.2f", sl_distance_pct * 100, tp_distance_pct * 100, rr_ratio)
+        self.logger.info("Position sizing: Capital=$%s, Size=%.2f%%, Allocation=$%s, Quantity=%.6f", f"{capital:,.2f}", final_size_pct * 100, f"{risk_assessment.quote_amount:,.2f}", quantity)
+        self.logger.info("Risk metrics: SL=%.2f%%, TP=%.2f%%, R/R=%.2f, Leverage=%dx", sl_distance_pct * 100, tp_distance_pct * 100, rr_ratio, leverage)
+
+        # Fee-Awareness Guardrail
+        if getattr(risk_assessment, "net_roi", 1) <= 0 or quantity <= 0:
+            self.logger.warning("Trade rejected due to Fee-Awareness Guardrail. Fees exceed projected take-profit.")
+            return None
 
         # Create position using Factory
         self.current_position = self.position_factory.create_position(
@@ -409,60 +393,24 @@ class TradingStrategy:
         # LIVE EXECUTION ENTRY
         if self.exchange_manager:
             try:
-                # MANDATORY STEP: Set Dynamic Leverage before opening order
-                if exchange_id == "bybit":
-                    success = await self.exchange_manager.set_leverage(
-                        exchange_id, symbol, int(risk_assessment.leverage)
-                    )
-                    if not success:
-                        self.logger.error("Failed to set leverage. Aborting order execution for safety.")
-                        self.current_position = None
-                        return None
-
                 order = None
-                if exchange_id == "bybit" and self.price_provider:
-                    # IMPLEMENTASI MARKETABLE LIMIT ORDER UNTUK BYBIT
-                    latest_ws_price = self.price_provider.get_latest_price()
-                    
-                    if latest_ws_price:
-                        # Gunakan harga dari WebSocket untuk mendapatkan Limit Price yang akurat
-                        # Berikan offset 0.05% agar order langsung terisi (marketable limit)
-                        offset_pct = 0.0005 # 0.05%
-                        
-                        if direction == "LONG":
-                            limit_price = latest_ws_price * (1 + offset_pct)
-                            self.logger.info(f"Using Bybit Marketable Limit BUY: WS Price ${latest_ws_price:,.2f} -> Limit ${limit_price:,.2f} (+0.05%)")
-                            order = await self.exchange_manager.create_limit_buy_order(
-                                exchange_id, symbol, quantity, limit_price
-                            )
-                        else:
-                            limit_price = latest_ws_price * (1 - offset_pct)
-                            self.logger.info(f"Using Bybit Marketable Limit SELL: WS Price ${latest_ws_price:,.2f} -> Limit ${limit_price:,.2f} (-0.05%)")
-                            order = await self.exchange_manager.create_limit_sell_order(
-                                exchange_id, symbol, quantity, limit_price
-                            )
-                    else:
-                        self.logger.warning("WebSocket price not available yet. Falling back to Market Order.")
-                        if direction == "LONG":
-                             order = await self.exchange_manager.create_market_buy_order(exchange_id, symbol, quantity)
-                        else:
-                             order = await self.exchange_manager.create_market_sell_order(exchange_id, symbol, quantity)
+                if direction == "LONG":
+                     order = await self.exchange_manager.create_futures_long(
+                         "bybit", symbol, quantity, leverage=leverage, current_price=current_price
+                     )
                 else:
-                    # Standar Market Order untuk platform lain atau jika WS tidak ada
-                    if direction == "LONG":
-                         # Tokocrypto (spot) uses quote_amount, others use quantity
-                         quote_param = risk_assessment.quote_amount if exchange_id == "tokocrypto" else 0.0
-                         order = await self.exchange_manager.create_market_buy_order(
-                             exchange_id, symbol, quantity,
-                             quote_amount=quote_param
-                         )
-                    else:
-                         order = await self.exchange_manager.create_market_sell_order(exchange_id, symbol, quantity)
+                     order = await self.exchange_manager.create_futures_short(
+                         "bybit", symbol, quantity, leverage=leverage, current_price=current_price
+                     )
                 
                 if order is None:
                      self.logger.warning("Live order rejected by exchange. Aborting local position creation.")
                      self.current_position = None
                      return None
+                
+                # Send async Telegram notification showing correct leverage
+                self._send_telegram_notification(direction, symbol, quantity, leverage, confidence)
+
             except Exception as e:
                 self.logger.error("Failed to execute live sequence: %s", e)
                 self.current_position = None
@@ -721,6 +669,27 @@ class TradingStrategy:
         except Exception as e:
             self.logger.warning("Could not extract confluence factors: %s", e)
         return tuple(factors)
+
+
+    def _send_telegram_notification(self, direction, symbol, qty, leverage, confidence):
+        """Fire-and-forget Telegram notification for new trade entry."""
+        try:
+            import threading, requests
+            token = getattr(self.config, 'BOT_TOKEN_TELEGRAM', None)
+            chat_id = getattr(self.config, 'TELEGRAM_CHAT_ID', None)
+            if not token or not chat_id:
+                return
+            emoji = "GREEN LONG" if direction == "LONG" else "RED SHORT"
+            msg = f"{emoji} {symbol} | Qty: {qty:.6f} | Lev: {leverage}x | Conf: {confidence}%"
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            def _send():
+                try:
+                    requests.post(url, json={"chat_id": chat_id, "text": msg}, timeout=5)
+                except Exception:
+                    pass
+            threading.Thread(target=_send, daemon=True).start()
+        except Exception:
+            pass
 
     def get_position_context(self, current_price: Optional[float] = None) -> str:
         """Get formatted context about current position for prompts.

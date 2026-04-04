@@ -46,6 +46,7 @@ from src.trading import (
 )
 from src.trading.vector_memory import VectorMemoryService
 from src.dashboard.server import DashboardServer
+from src.dashboard.dashboard_state import dashboard_state
 from src.notifiers import DiscordNotifier, ConsoleNotifier
 from src.utils.keyboard_handler import KeyboardHandler
 from src.parsing.unified_parser import UnifiedParser
@@ -199,6 +200,7 @@ class CompositionRoot:
             'market_analyzer': analyzer['engine'],
             'trading_strategy': trading['strategy'],
             'discord_notifier': notifiers['notifier'],
+            'telegram_notifier': notifiers.get('telegram_notifier'),
             'discord_task': notifiers['task'],
             'keyboard_handler': infra['keyboard_handler'],
             'rag_engine': rag,
@@ -213,7 +215,9 @@ class CompositionRoot:
             'brain_service': trading['brain_service'],
             'statistics_service': trading['statistics_service'],
             'memory_service': trading['memory_service'],
-            'unified_parser': utils['parser']
+            'unified_parser': utils['parser'],
+            'dashboard_state': dashboard_state,
+            'bybit_ws': trading.get('bybit_ws')
         }
 
         return deps
@@ -456,8 +460,7 @@ class CompositionRoot:
             self.logger, persistence, brain_service, statistics_service, memory_service,
             risk_manager, self.config, PositionExtractor(self.logger, utils['parser']),
             PositionFactory(self.logger),
-            exchange_manager=infra['exchange_manager'],
-            price_provider=bybit_ws
+            exchange_manager=infra['exchange_manager']
         )
         
         return {
@@ -474,6 +477,7 @@ class CompositionRoot:
         notifier = None
         task = None
         
+        # --- Discord Notifier Initialization ---
         if self.config.DISCORD_BOT_ENABLED and hasattr(self.config, 'BOT_TOKEN_DISCORD') and self.config.BOT_TOKEN_DISCORD:
             try:
                 import discord
@@ -518,7 +522,14 @@ class CompositionRoot:
         else:
             notifier = ConsoleNotifier(self.logger, self.config, utils['parser'], utils['format_utils'])
             
-        return {'notifier': notifier, 'task': task}
+        # --- Telegram Notifier Initialization ---
+        telegram_notifier = None
+        if hasattr(self.config, 'BOT_TOKEN_TELEGRAM') and self.config.BOT_TOKEN_TELEGRAM:
+            from src.notifiers.telegram_notifier import TelegramNotifier
+            telegram_notifier = TelegramNotifier(self.logger, self.config, utils['parser'], utils['format_utils'])
+            await telegram_notifier.start()
+            
+        return {'notifier': notifier, 'task': task, 'telegram_notifier': telegram_notifier}
     
     async def _start_trading_bot(self):
         """Build dependencies and start the Heavy AI Trading Bot."""
