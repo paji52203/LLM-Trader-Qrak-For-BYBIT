@@ -563,7 +563,7 @@ class CompositionRoot:
 
         # Wire trading_strategy into dashboard_state for manual TP/SL override
         if self.dashboard_server and self.dashboard_server.dashboard_state:
-            self.dashboard_server.dashboard_state.trading_strategy = dependencies.get('trading_strategy')
+            self.dashboard_server.dashboard_state.trading_strategy = trading['strategy']
 
         self._bot_running = True
         if self.dashboard_server:

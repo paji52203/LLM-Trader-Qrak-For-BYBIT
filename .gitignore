@@ -1,0 +1,34 @@
+
+# API Keys - JANGAN pernah di-share!
+# Cache & build artifacts
+# Cache AI & market data
+# Data trading & market cache (lokal saja)
+# Logs
+# OS files
+# Temp & debug files
+# Virtual Environment
+*.db
+*.egg-info/
+*.log
+*.py[cod]
+*.pyd
+*.pyo
+*.sqlite
+*.tmp
+.DS_Store
+.Python
+.env
+.venv
+Thumbs.db
+__pycache__/
+build/
+cache/
+data/
+debug*.log
+dist/
+env/
+keys.env
+logs/
+nohup.out
+trading_data/
+venv/

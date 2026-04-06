@@ -1,0 +1,745 @@
+"""Main entry point for the Crypto Trading Bot application.
+
+This module defines the `CryptoTradingBot` class, which orchestrates the interaction
+between various components like the market analyzer, trading strategy, and external APIs.
+"""
+import asyncio
+import os
+import json
+from pathlib import Path
+
+import time
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+
+from src.logger.logger import Logger
+from src.utils.timeframe_validator import TimeframeValidator
+from src.managers.persistence_manager import PersistenceManager
+from src.contracts.model_contract import ModelManagerProtocol
+from src.trading import (
+    TradingBrainService,
+    TradingStatisticsService,
+    TradingMemoryService
+)
+
+
+# Configuration Constants
+POSITION_UPDATE_INTERVAL = 3600  # 1 hour
+SLEEP_CHUNK_SIZE = 1.0  # Check for interruptions every second
+CANDLE_BUFFER_SECONDS = 2  # Seconds to wait after candle start
+ERROR_WAIT_SHORT = 60   # Seconds to wait after minor error
+ERROR_WAIT_LONG = 300   # Seconds to wait after major error
+
+
+class CryptoTradingBot:
+    """Automated crypto trading bot - TRADING MODE ONLY."""
+
+    def __init__(
+        self,
+        logger: Logger,
+        config,
+        shutdown_manager: Optional[Any],
+        exchange_manager,
+        market_analyzer,
+        trading_strategy,
+        discord_notifier,
+        telegram_notifier,
+        keyboard_handler,
+        rag_engine,
+        coingecko_api,
+        news_client,
+        market_api,
+        categories_api,
+        alternative_me_api,
+        cryptocompare_session,
+        persistence: PersistenceManager,
+        model_manager: ModelManagerProtocol,
+        brain_service: TradingBrainService,
+        statistics_service: TradingStatisticsService,
+        memory_service: TradingMemoryService,
+        dashboard_state = None,
+        discord_task: Optional[asyncio.Task] = None,
+        bybit_ws = None
+    ):
+        # pylint: disable=too-many-arguments, too-many-locals
+        # Reason: Dependency Injection pattern requires all components to be injected.
+        """Initialize bot with all dependencies injected.
+
+        All components are injected via constructor following the Dependency
+        Injection pattern, with start.py acting as the composition root.
+        """
+        self.logger = logger
+        self.config = config
+        self.shutdown_manager = shutdown_manager
+
+        # Injected core components
+        self.exchange_manager = exchange_manager
+        self.market_analyzer = market_analyzer
+        self.trading_strategy = trading_strategy
+        self.discord_notifier = discord_notifier
+        self.telegram_notifier = telegram_notifier
+        self.keyboard_handler = keyboard_handler
+        self.rag_engine = rag_engine
+
+        # Injected API clients
+        self.coingecko_api = coingecko_api
+        self.news_client = news_client
+        self.market_api = market_api
+        self.categories_api = categories_api
+        self.alternative_me_api = alternative_me_api
+        self.cryptocompare_session = cryptocompare_session
+
+        # Injected trading services
+        self.persistence = persistence
+        self.model_manager = model_manager
+        self.brain_service = brain_service
+        self.statistics_service = statistics_service
+        self.memory_service = memory_service
+        self.dashboard_state = dashboard_state
+        self.bybit_ws = bybit_ws
+
+        # Runtime state
+        self.tasks = []
+        self.running = False
+        self._active_tasks = set()
+        self._force_analysis = asyncio.Event()
+        self._discord_task = discord_task
+        self._position_status_task: Optional[asyncio.Task] = None
+
+        # Trading state
+        self.current_exchange = None
+        self.current_symbol: Optional[str] = None
+        self.current_timeframe: Optional[str] = None
+        self.current_check_interval = 0  # 0 means follow timeframe candle
+
+    async def initialize(self):
+        """Initialize all components."""
+        if self.shutdown_manager:
+            self.shutdown_manager.register_shutdown_callback(self.shutdown)
+
+            # Register components for shutdown
+            if self.keyboard_handler:
+                self.shutdown_manager.register_shutdown_callback(self.keyboard_handler.stop_listening)
+
+            if self.model_manager:
+                self.shutdown_manager.register_shutdown_callback(self.model_manager.close)
+
+            if self.market_analyzer:
+                self.shutdown_manager.register_shutdown_callback(self.market_analyzer.close)
+
+            if self.rag_engine:
+                self.shutdown_manager.register_shutdown_callback(self.rag_engine.close)
+
+            if self.exchange_manager:
+                self.shutdown_manager.register_shutdown_callback(self.exchange_manager.shutdown)
+
+            if self.telegram_notifier:
+                self.shutdown_manager.register_shutdown_callback(self.telegram_notifier.close)
+
+            if self.cryptocompare_session:
+                self.shutdown_manager.register_shutdown_callback(self.cryptocompare_session.close)
+
+            # API clients (if they have close method)
+            for client in [self.alternative_me_api, self.coingecko_api, self.news_client, self.market_api, self.categories_api]:
+                if client:
+                    try:
+                        self.shutdown_manager.register_shutdown_callback(client.close)
+                    except AttributeError:
+                        pass
+
+        # Register keyboard commands
+        self.keyboard_handler.register_command('a', self._force_analysis_now, "Force immediate analysis")
+        self.keyboard_handler.register_command('h', self._show_help, "Show available keyboard commands")
+        self.keyboard_handler.register_command('q', self._request_shutdown, "Quit the application")
+
+        # Start keyboard handler task
+        keyboard_task = asyncio.create_task(
+            self.keyboard_handler.start_listening(),
+            name="Keyboard-Handler"
+        )
+        self._active_tasks.add(keyboard_task)
+        keyboard_task.add_done_callback(self._active_tasks.discard)
+        self.tasks.append(keyboard_task)
+
+        self.logger.info("Crypto Trading Bot ready")
+    async def shutdown(self):
+        """Callback for graceful shutdown."""
+        self.logger.info("Signaling trading loops to stop...")
+        self.running = False
+
+        # Cancel active tasks managed by bot
+        pending_tasks = list(self._active_tasks)
+        if pending_tasks:
+            self.logger.info("Cancelling %s bot-specific tasks...", len(pending_tasks))
+            for task in pending_tasks:
+                if not task.done():
+                    task.cancel()
+            try:
+                await asyncio.wait(pending_tasks, timeout=3.0)
+            except asyncio.TimeoutError:
+                self.logger.warning("Bot tasks shutdown timed out")
+
+        # Discord task cleanup
+        if self._discord_task and not self._discord_task.done():
+            self._discord_task.cancel()
+            try:
+                await asyncio.wait_for(self._discord_task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
+        self.logger.info("Bot shutdown signaling complete.")
+
+
+    async def run(self, symbol: str, timeframe: str = None):
+        """Run the trading bot in continuous mode.
+
+        Args:
+            symbol: Trading pair (e.g., "BTC/USDT")
+            timeframe: Optional timeframe override
+        """
+        self.current_symbol = symbol
+        self.current_timeframe = timeframe or self.config.TIMEFRAME
+
+        # Find exchange that supports the symbol
+        exchange, exchange_id = await self.exchange_manager.find_symbol_exchange(symbol)
+        if not exchange:
+            self.logger.error("Symbol %s not found on any configured exchange", symbol)
+            return
+
+        self.current_exchange = exchange
+        self.logger.info("Starting trading for %s on %s", symbol, exchange_id)
+        self.logger.info("Timeframe: %s", self.current_timeframe)
+
+        # Initialize analyzer for this symbol
+        self.market_analyzer.initialize_for_symbol(
+            symbol=symbol,
+            exchange=exchange,
+            timeframe=self.current_timeframe
+        )
+
+        # Enable running state before starting any async loops
+        self.running = True
+        check_count = 0
+
+        # Log current position if any
+        if self.trading_strategy.current_position:
+            position = self.trading_strategy.current_position
+            self.logger.info("Existing position: %s @ $%s", position.direction, f"{position.entry_price:,.2f}")
+            # Start hourly position updates for existing position
+            if self.discord_notifier or self.telegram_notifier:
+                await self._start_position_status_updates()
+        else:
+            self.logger.info("No existing position")
+
+        # Fetch initial price for dashboard (one-time startup call)
+        await self._fetch_current_ticker()
+
+        # Check if resuming from previous session (regardless of position status)
+        last_analysis_time = self.persistence.get_last_analysis_time()
+        if last_analysis_time:
+            self.logger.info("Resuming from last analysis at %s UTC", last_analysis_time.strftime('%Y-%m-%d %H:%M:%S'))
+            await self._wait_until_next_timeframe_after(last_analysis_time)
+        self.logger.info("Ready for next analysis after wait")
+
+        # Initial run is considered regular (unless we want to skipping update on restart, but safer to update)
+        is_regular_run = True
+
+        while self.running:
+            try:
+                # Check for manual overrides (coin, timeframe, interval)
+                await self._check_manual_overrides()
+                
+                # Sync real balance if on Tokocrypto
+                await self._sync_exchange_balance()
+                
+                check_count += 1
+                await self._execute_trading_check(check_count, force_news_update=is_regular_run, is_candle_close=is_regular_run)
+
+                # Check if still running before waiting
+                if not self.running:
+                    break
+
+                # Wait for next timeframe
+                # Returns True if forced (interrupted), False if waited full duration (regular)
+                was_forced_wait = await self._wait_for_next_timeframe()
+                is_regular_run = not was_forced_wait
+
+            except asyncio.CancelledError:
+                self.logger.info("Trading cancelled")
+                self.running = False
+                break
+            except Exception as e:
+                self.logger.error("Error in trading loop: %s", e)
+                await self._interruptible_sleep(ERROR_WAIT_SHORT)
+
+    async def _execute_trading_check(self, check_count: int, force_news_update: bool = True, is_candle_close: bool = True):
+        """Execute a single trading check iteration."""
+        self._log_check_header(check_count)
+        
+        current_ticker, current_price = await self._fetch_ticker_data()
+        await self.trading_strategy.sync_with_exchange(self.current_symbol)
+        await self._check_position_status(current_price, is_candle_close=is_candle_close)
+        await self._execute_market_knowledge_update(force_news_update)
+        
+        self.logger.info("Running market analysis...")
+        context_data = await self._build_analysis_context(current_price, current_ticker)
+        result = await self.market_analyzer.analyze_market(**context_data)
+        
+        if "error" in result:
+            self.logger.error("Analysis failed: %s", result['error'])
+            return
+        
+        self.persistence.save_last_analysis_time()
+        decision = await self.trading_strategy.process_analysis(result, self.current_symbol)
+        
+        if decision:
+            if self.discord_notifier:
+                await self.discord_notifier.send_trading_decision(decision, self.config.MAIN_CHANNEL_ID)
+            if self.telegram_notifier:
+                await self.telegram_notifier.send_trading_decision(decision)
+            await self._handle_new_position(decision, current_price)
+        else:
+            self.logger.info("No trading action taken")
+
+        await self._send_discord_notification(result)
+        self._save_analysis_data(result)
+    
+    def _log_check_header(self, check_count: int):
+        """Log trading check header"""
+        current_time = datetime.now()
+        self.logger.info("=" * 60)
+        self.logger.info("Trading Check #%s at %s", check_count, current_time.strftime('%Y-%m-%d %H:%M:%S'))
+        self.logger.info("=" * 60)
+    
+    async def _fetch_ticker_data(self):
+        """Fetch current ticker and price"""
+        try:
+            current_ticker = await self._fetch_current_ticker()
+            if current_ticker:
+                current_price = float(current_ticker.get('last', current_ticker.get('close', 0)))
+                return current_ticker, current_price
+        except Exception as e:
+            self.logger.warning("Could not fetch current ticker: %s", e)
+        return None, None
+    
+    async def _check_position_status(self, current_price: Optional[float], *, is_candle_close: bool = True):
+        """Check if existing position hit stop/target.
+
+        Soft stop mode: SL/TP evaluation only runs on candle close.
+        Forced analysis (keyboard 'a') skips automated stop checks
+        but the AI can still consciously signal CLOSE.
+        """
+        if not (self.trading_strategy.current_position and current_price is not None):
+            return
+
+        if not is_candle_close:
+            self.logger.info("Intra-candle check: skipping SL/TP evaluation (soft stop mode)")
+            return
+
+        try:
+            close_reason = await self.trading_strategy.check_position(current_price)
+            if close_reason:
+                self.logger.info("Position closed: %s", close_reason)
+                await self._stop_position_status_updates()
+                if self.discord_notifier:
+                    history = self.persistence.load_trade_history()
+                    await self.discord_notifier.send_performance_stats(
+                        trade_history=history,
+                        symbol=self.current_symbol,
+                        channel_id=self.config.MAIN_CHANNEL_ID
+                    )
+                if self.telegram_notifier:
+                    history = self.persistence.load_trade_history()
+                    await self.telegram_notifier.send_performance_stats(
+                        trade_history=history,
+                        symbol=self.current_symbol
+                    )
+        except Exception as e:
+            self.logger.error("Error checking position: %s", e)
+    
+    async def _execute_market_knowledge_update(self, force_news_update: bool):
+        """Update market knowledge based on analysis type"""
+        if force_news_update:
+            self.logger.info("Updating market knowledge (Regular Analysis)...")
+            await self.rag_engine.update_if_needed(force_update=True)
+        else:
+            self.logger.info("Skipping forced market knowledge update (Forced Analysis)")
+            await self.rag_engine.update_if_needed(force_update=False)
+    
+    async def _build_analysis_context(self, current_price: Optional[float], current_ticker) -> Dict[str, Any]:
+        """Build context data for market analysis"""
+        position_context = self.trading_strategy.get_position_context(current_price)
+        memory_context = self.memory_service.get_context_summary()
+        statistics_context = self.statistics_service.get_context()
+        
+        if statistics_context:
+            position_context = f"{position_context}\n\n{statistics_context}"
+        
+        previous_data = await self.persistence.async_load_previous_response()
+        previous_response = previous_data.get("response") if previous_data else None
+        previous_indicators = previous_data.get("technical_indicators") if previous_data else None
+        
+        last_analysis_time_str = self._get_formatted_last_analysis_time()
+        dynamic_thresholds = self.brain_service.get_dynamic_thresholds()
+        
+        return {
+            "previous_response": previous_response,
+            "previous_indicators": previous_indicators,
+            "position_context": position_context,
+            "performance_context": memory_context,
+            "brain_service": self.brain_service,
+            "last_analysis_time": last_analysis_time_str,
+            "current_ticker": current_ticker,
+            "dynamic_thresholds": dynamic_thresholds
+        }
+    
+    def _get_formatted_last_analysis_time(self) -> Optional[str]:
+        """Get last analysis time formatted as UTC string"""
+        last_analysis_time_obj = self.persistence.get_last_analysis_time()
+        if not last_analysis_time_obj:
+            return None
+        
+        if last_analysis_time_obj.tzinfo is None:
+            last_analysis_time_obj = last_analysis_time_obj.astimezone(timezone.utc)
+        else:
+            last_analysis_time_obj = last_analysis_time_obj.astimezone(timezone.utc)
+        
+        return last_analysis_time_obj.strftime('%Y-%m-%d %H:%M:%S')
+    
+    async def _handle_new_position(self, decision, current_price: Optional[float]):
+        """Handle new position creation and status updates"""
+        if decision.action not in ('BUY', 'SELL') or not self.trading_strategy.current_position:
+            return
+        
+        if not self.discord_notifier and not self.telegram_notifier:
+            return
+        
+        try:
+            if current_price is None:
+                ticker = await self._fetch_current_ticker()
+                current_price = float(ticker.get('last', ticker.get('close', 0))) if ticker else 0.0
+            
+            if self.discord_notifier:
+                await self.discord_notifier.send_position_status(
+                    position=self.trading_strategy.current_position,
+                    current_price=current_price,
+                    channel_id=self.config.MAIN_CHANNEL_ID
+                )
+            if self.telegram_notifier:
+                await self.telegram_notifier.send_position_status(
+                    position=self.trading_strategy.current_position,
+                    current_price=current_price
+                )
+        except Exception as e:
+            self.logger.warning("Error sending initial position status: %s", e)
+        
+        await self._start_position_status_updates()
+    
+    async def _send_discord_notification(self, result: Dict[str, Any]):
+        """Send Discord notification with analysis results"""
+        if self.discord_notifier:
+            await self.discord_notifier.send_analysis_notification(
+                result=result,
+                symbol=self.current_symbol,
+                timeframe=self.current_timeframe,
+                channel_id=self.config.MAIN_CHANNEL_ID
+            )
+        if self.telegram_notifier:
+            await self.telegram_notifier.send_analysis_notification(
+                result=result,
+                symbol=self.current_symbol,
+                timeframe=self.current_timeframe
+            )
+    
+    def _save_analysis_data(self, result: Dict[str, Any]):
+        """Save analysis response and technical data"""
+        raw_response = result.get("raw_response", "")
+        if raw_response:
+            technical_data = result.get("technical_data")
+            generated_prompt = result.get("generated_prompt")
+            self.persistence.save_previous_response(raw_response, technical_data, generated_prompt)
+
+    async def _fetch_current_ticker(self) -> Optional[Dict[str, Any]]:
+        """Fetch current ticker from exchange."""
+        try:
+            ticker = await self.current_exchange.fetch_ticker(self.current_symbol)
+            if ticker and self.dashboard_state:
+                price = float(ticker.get('last', ticker.get('close', 0)))
+                if price > 0:
+                    await self.dashboard_state.update_price(price)
+            return ticker
+        except Exception as e:
+            self.logger.error("Error fetching current ticker: %s", e)
+            return None
+
+    async def _wait_for_next_timeframe(self):
+        """Wait until the next timeframe candle starts or custom interval expires."""
+        try:
+            current_time_ms = int(time.time() * 1000)
+
+            # 1. Check if we have a custom interval override
+            if self.current_check_interval > 0:
+                delay_seconds = self.current_check_interval * 60
+                next_check_time = datetime.fromtimestamp(time.time() + delay_seconds, timezone.utc)
+                self.logger.info("Custom check interval active: %dm. Next check at %s UTC", 
+                                 self.current_check_interval, next_check_time.strftime('%Y-%m-%d %H:%M:%S'))
+            else:
+                # 2. Standard behavior: Calculate next candle start using validator
+                next_candle_ms = TimeframeValidator.calculate_next_candle_time(current_time_ms, self.current_timeframe)
+                delay_ms = next_candle_ms - current_time_ms + (CANDLE_BUFFER_SECONDS * 1000)
+                delay_seconds = max(0, delay_ms / 1000)
+                next_check_time = datetime.fromtimestamp(next_candle_ms / 1000, timezone.utc)
+                self.logger.info("Next check at %s UTC (in %.0fs)", next_check_time.strftime('%Y-%m-%d %H:%M:%S'), delay_seconds)
+
+            if self.dashboard_state:
+                await self.dashboard_state.update_next_check(next_check_time)
+            
+            return await self._interruptible_sleep(delay_seconds)
+
+        except Exception as e:
+            self.logger.error("Error calculating next timeframe: %s", e)
+            await self._interruptible_sleep(ERROR_WAIT_LONG)
+            return False
+
+    async def _wait_until_next_timeframe_after(self, last_time: datetime):
+        """Wait until the next timeframe candle after a specific timestamp.
+
+        Args:
+            last_time: Timestamp of last analysis
+        """
+        try:
+            # Ensure last_time is timezone-aware (assume UTC if naive)
+            if last_time.tzinfo is None:
+                last_time = last_time.replace(tzinfo=timezone.utc)
+
+            current_time_ms = int(time.time() * 1000)
+            last_time_ms = int(last_time.timestamp() * 1000)
+
+            # Calculate next candle after last analysis using validator (handles alignment)
+            next_candle_ms = TimeframeValidator.calculate_next_candle_time(last_time_ms, self.current_timeframe)
+
+            # Check if we're past the next candle boundary
+            if current_time_ms >= next_candle_ms:
+                self.logger.info("Resuming from last check at %s. Next candle already passed - proceeding immediately", last_time.strftime('%Y-%m-%d %H:%M:%S'))
+                return
+
+            # Wait for next candle
+            # Use buffer to ensure we are safely into the next candle
+            delay_ms = next_candle_ms - current_time_ms + (CANDLE_BUFFER_SECONDS * 1000)
+            delay_seconds = max(0, delay_ms / 1000)
+            next_check_time = datetime.fromtimestamp(next_candle_ms / 1000, timezone.utc)
+
+            # Check if we're still within the same candle as the last analysis (for logging context)
+            is_same = TimeframeValidator.is_same_candle(current_time_ms, last_time_ms, self.current_timeframe)
+
+            context_msg = "Still in same candle" if is_same else "Resuming wait"
+            self.logger.info("Resuming from last check at %s. %s - next check at %s UTC (in %.0fs)", last_time.strftime('%Y-%m-%d %H:%M:%S'), context_msg, next_check_time.strftime('%Y-%m-%d %H:%M:%S'), delay_seconds)
+
+            if self.dashboard_state:
+                await self.dashboard_state.update_next_check(next_check_time)
+            await self._interruptible_sleep(delay_seconds)
+
+        except Exception as e:
+            self.logger.error("Error calculating wait time: %s", e)
+            await self._interruptible_sleep(ERROR_WAIT_SHORT)
+
+    async def _interruptible_sleep(self, seconds: float, respect_force_analysis: bool = True):
+        """Sleep in small chunks to allow responsive shutdown and force analysis.
+
+        Uses SLEEP_CHUNK_SIZE to check for interruptions periodically.
+
+        Args:
+            seconds: Duration to sleep
+            respect_force_analysis: If True, wake early on force analysis event (main loop only)
+
+        Returns:
+            bool: True if sleep was interrupted by force_analysis, False otherwise
+        """
+        start_time = time.monotonic()  # Use monotonic clock to track real elapsed time
+
+        # Only clear force analysis flag for main loop sleeps
+        if respect_force_analysis:
+            self._force_analysis.clear()
+
+        while self.running:
+            elapsed = time.monotonic() - start_time
+            if elapsed >= seconds:
+                break
+
+            # Check for force analysis (only if this sleep respects it)
+            if respect_force_analysis and self._force_analysis.is_set():
+                self._force_analysis.clear()
+                self.logger.info("Force analysis triggered - interrupting wait")
+                return True
+
+            # Real-time WebSocket Alarm Check!
+            if getattr(self, 'bybit_ws', None) and self.trading_strategy.current_position:
+                ws_price = self.bybit_ws.get_latest_price()
+                if ws_price:
+                    # Check if current websocket price trips local soft-stops
+                    close_reason = await self.trading_strategy.check_position(ws_price)
+                    if close_reason:
+                        self.logger.critical("🚨 WEBSOCKET ALARM TRIPPED! Market crossed %s at $%.2f. WAKING UP BOT!", close_reason.upper(), ws_price)
+                        if respect_force_analysis:
+                            self._force_analysis.clear()
+                            return True
+
+            remaining = seconds - elapsed
+            sleep_time = min(SLEEP_CHUNK_SIZE, remaining)
+            await asyncio.sleep(sleep_time)
+
+        return False
+
+    async def _force_analysis_now(self):
+        """Force immediate analysis by interrupting the wait."""
+        self.logger.info("Forcing immediate analysis...")
+        self._force_analysis.set()
+
+    async def _start_position_status_updates(self):
+        """Start periodic position status updates to Discord (every hour)."""
+        if self._position_status_task and not self._position_status_task.done():
+            return  # Already running
+
+        self._position_status_task = asyncio.create_task(
+            self._position_status_loop(),
+            name="Position-Status-Updates"
+        )
+        self._active_tasks.add(self._position_status_task)
+        self._position_status_task.add_done_callback(self._active_tasks.discard)
+        self.logger.debug("Started hourly position status updates")
+
+    async def _stop_position_status_updates(self):
+        """Stop periodic position status updates."""
+        if self._position_status_task and not self._position_status_task.done():
+            self._position_status_task.cancel()
+            try:
+                await self._position_status_task
+            except asyncio.CancelledError:
+                pass
+            self._position_status_task = None
+            self.logger.debug("Stopped position status updates")
+
+    async def _position_status_loop(self):
+        """Send position status updates every hour while position is open."""
+        try:
+            while self.running:
+                # Wait for interval (in chunks for responsiveness)
+                await self._interruptible_sleep(POSITION_UPDATE_INTERVAL, respect_force_analysis=False)
+
+                if not self.running:
+                    break
+
+                # Check if position is still open
+                if not self.trading_strategy.current_position:
+                    self.logger.debug("Position closed, stopping status updates")
+                    break
+
+                # Send position status update
+                if self.discord_notifier:
+                    try:
+                        ticker = await self._fetch_current_ticker()
+                        current_price = float(ticker.get('last', ticker.get('close', 0))) if ticker else 0.0
+
+                        await self.discord_notifier.send_position_status(
+                            position=self.trading_strategy.current_position,
+                            current_price=current_price,
+                            channel_id=self.config.MAIN_CHANNEL_ID
+                        )
+                        self.logger.debug("Sent hourly position status update to Discord")
+                    except Exception as e:
+                        self.logger.warning("Error sending position status update: %s", e)
+                
+                if self.telegram_notifier:
+                    try:
+                        ticker = await self._fetch_current_ticker()
+                        current_price = float(ticker.get('last', ticker.get('close', 0))) if ticker else 0.0
+
+                        await self.telegram_notifier.send_position_status(
+                            position=self.trading_strategy.current_position,
+                            current_price=current_price
+                        )
+                        self.logger.debug("Sent hourly position status update to Telegram")
+                    except Exception as e:
+                        self.logger.warning("Error sending telegram position status update: %s", e)
+        except asyncio.CancelledError:
+            self.logger.debug("Position status loop cancelled")
+            raise
+
+    async def _sync_exchange_balance(self):
+        """Sync actual exchange balance to dashboard state if live."""
+        if not self.dashboard_state:
+            return
+            
+        try:
+            # Sync USDT (or quote) balance from Tokocrypto if possible
+            quote = self.config.QUOTE_CURRENCY
+            balance = await self.exchange_manager.get_balance(quote)
+            if balance is not None and balance > 0:
+                await self.dashboard_state.update_capital(balance)
+        except Exception as e:
+            self.logger.debug("Minor: Could not sync live balance: %s", e)
+
+    async def _show_help(self):
+        """Show help information about available commands."""
+        self.keyboard_handler.display_help()
+
+    async def _request_shutdown(self):
+        """Request application shutdown via keyboard."""
+        self.logger.info("Shutdown requested via keyboard command")
+        if self.shutdown_manager:
+            await self.shutdown_manager.shutdown_gracefully()
+        else:
+            self.running = False
+            for task in self.tasks:
+                if not task.done():
+                    task.cancel()
+    async def _check_manual_overrides(self):
+        """Check if trading coin or timeframe was manually overridden in dashboard."""
+        path = Path(self.config.DATA_DIR) / "manual_overrides.json"
+        if not path.exists():
+            return
+            
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                manual_coin = data.get("manual_coin", "").strip().upper()
+                manual_timeframe = data.get("timeframe", "").strip().lower()
+                manual_interval = data.get("check_interval_mins", 0)
+                
+                changed = False
+                
+                # Check Coin Switch
+                if manual_coin and manual_coin != self.current_symbol:
+                    self.logger.info("Manual coin override detected: %s -> %s", self.current_symbol, manual_coin)
+                    exchange, _ = await self.exchange_manager.find_symbol_exchange(manual_coin)
+                    if exchange:
+                        self.current_symbol = manual_coin
+                        self.current_exchange = exchange
+                        changed = True
+                    else:
+                        self.logger.error("Symbol %s not found on any configured exchange", manual_coin)
+
+                # Check Timeframe Switch
+                if manual_timeframe and manual_timeframe != self.current_timeframe:
+                    self.logger.info("Manual timeframe override: %s -> %s", self.current_timeframe, manual_timeframe)
+                    valid_timeframes = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d']
+                    if manual_timeframe in valid_timeframes:
+                        self.current_timeframe = manual_timeframe
+                        changed = True
+
+                # Check Interval Switch
+                if manual_interval is not None and int(manual_interval) != self.current_check_interval:
+                    self.logger.info("Manual check interval override: %dm -> %dm", 
+                                     self.current_check_interval, int(manual_interval))
+                    self.current_check_interval = int(manual_interval)
+                    # changing interval doesn't require analyzer re-init, just sleep duration change
+
+                if changed:
+                    self.market_analyzer.initialize_for_symbol(
+                        symbol=self.current_symbol,
+                        exchange=self.current_exchange,
+                        timeframe=self.current_timeframe
+                    )
+                    self.logger.critical("Bot successfully applied overrides: %s @ %s", self.current_symbol, self.current_timeframe)
+        except Exception as e:
+            self.logger.error("Error checking manual overrides: %s", e)
