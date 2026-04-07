@@ -32,3 +32,4 @@ logs/
 nohup.out
 trading_data/
 venv/
+.aider*

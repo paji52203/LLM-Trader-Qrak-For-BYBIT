@@ -4,7 +4,7 @@ lm_studio_base_url = http://localhost:1234/v1
 lm_studio_model =
 lm_studio_streaming = false
 openrouter_base_url = https://openrouter.ai/api/v1
-openrouter_base_model = deepseek/deepseek-v3.2
+openrouter_base_model = anthropic/claude-3.5-haiku
 openrouter_fallback_model = deepseek/deepseek-r1:free
 google_studio_model = gemini-3-flash-preview
 blockrun_base_url = https://blockrun.ai/api
@@ -12,6 +12,7 @@ blockrun_model = deepseek/deepseek-reasoner
 
 [general]
 crypto_pair = BTC/USDT:USDT
+
 timeframe = 4H
 candle_limit = 999
 ai_chart_candle_limit = 125
@@ -43,8 +44,8 @@ supported = bybit
 market_refresh_hours = 24
 
 [bybit_futures]
-default_leverage = 50
-max_leverage = 100
+default_leverage = 10
+max_leverage = 10
 min_confidence_to_trade = 60
 
 [demo_trading]

@@ -131,14 +131,14 @@ class MarketDataCollector:
             # Fetch long-term historical data for additional context
             await self.fetch_long_term_historical_data(context)
 
-            # Fetch MTF Snapshot context
-            await self._fetch_mtf_snapshot(context)
-
             # Fetch weekly macro data for 200W SMA analysis
             await self.fetch_weekly_macro_data(context, target_weeks=300)
 
             # Fetch and process market sentiment data
             await self.fetch_and_process_sentiment_data(context)
+
+            # [🆕 UPGRADE: Fetch Macro Bias H1/H4]
+            await self.fetch_macro_bias_data(context)
 
             return True
 
@@ -146,55 +146,23 @@ class MarketDataCollector:
             self.logger.exception("OHLCV fetch failed: %s", str(e))
             return False
 
-    async def _fetch_mtf_snapshot(self, context) -> bool:
-        """Fetch and analyze Multi-Timeframe (MTF) Data"""
+    async def fetch_macro_bias_data(self, context) -> bool:
+        """Fetch H1 and H4 candles for directional bias report."""
         try:
-            if self.timeframe == '15m':
-                tfs = ['5m', '1h']
-            elif self.timeframe == '30m':
-                tfs = ['15m', '4h']
-            elif self.timeframe == '1h':
-                tfs = ['15m', '4h']
-            elif self.timeframe == '4h':
-                tfs = ['1h', '1d']
-            else:
-                context.mtf_alignment = "N/A (Standard analysis)"
-                return True
-                
-            mtf_str = []
-            for tf in tfs:
-                res = await self.data_fetcher.fetch_candlestick_data(
-                    pair=self.symbol,
-                    timeframe=tf,
-                    limit=30
-                )
-                if res is None: continue
-                candles, _ = res
-                import pandas as pd
-                import pandas_ta as ta
-                df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                if len(df) >= 15:
-                    df['rsi'] = ta.rsi(df['close'], length=14)
-                    df['ema9'] = ta.ema(df['close'], length=9)
-                    
-                    last_row = df.iloc[-1]
-                    rsi_val = last_row['rsi'] if not pd.isna(last_row['rsi']) else 50
-                    ema_val = last_row['ema9'] if not pd.isna(last_row['ema9']) else last_row['close']
-                    
-                    close_val = float(last_row['close'])
-                    ema_numeric = float(ema_val)
-                    trend = "BULLISH" if close_val > ema_numeric else "BEARISH"
-                    
-                    mtf_str.append(f"[{tf}] Trend: {trend} (Close vs EMA9) | RSI: {rsi_val:.1f}")
-                else:
-                    mtf_str.append(f"[{tf}] Insufficient Data")
+            if not self.symbol or not self.data_fetcher:
+                return False
+
+            h1_result = await self.data_fetcher.fetch_candlestick_data(self.symbol, "1h", limit=5)
+            if h1_result is not None and h1_result[0] is not None:
+                context.h1_candles = h1_result[0]
             
-            context.mtf_alignment = "\\n".join(mtf_str)
+            h4_result = await self.data_fetcher.fetch_candlestick_data(self.symbol, "4h", limit=5)
+            if h4_result is not None and h4_result[0] is not None:
+                context.h4_candles = h4_result[0]
+                
             return True
         except Exception as e:
-            import traceback
-            self.logger.error("MTF error: %s", e)
-            context.mtf_alignment = "MTF Data Unavailable"
+            self.logger.warning("Failed to fetch macro bias data: %s", e)
             return False
 
     async def fetch_long_term_historical_data(self, context, days: int = 365) -> bool:

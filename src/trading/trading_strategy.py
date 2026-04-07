@@ -110,10 +110,18 @@ class TradingStrategy:
         if self.exchange_manager and self.current_position:
             try:
                 exchange_id = self.config.SUPPORTED_EXCHANGES[0] if self.config.SUPPORTED_EXCHANGES else "bybit"
-                if self.current_position.direction == "LONG":
-                    await self.exchange_manager.create_market_sell_order(exchange_id, self.current_position.symbol, self.current_position.size)
-                else:
-                    await self.exchange_manager.create_market_buy_order(exchange_id, self.current_position.symbol, self.current_position.size)
+                await self.exchange_manager.close_futures_position(
+                    exchange_id,
+                    self.current_position.symbol,
+                    self.current_position.direction,
+                    self.current_position.size
+                )
+                self.logger.info(
+                    "Close order sent: %s %s qty=%.6f",
+                    self.current_position.direction,
+                    self.current_position.symbol,
+                    self.current_position.size,
+                )
             except Exception as e:
                 self.logger.error("Failed to close live order: %s", e)
 

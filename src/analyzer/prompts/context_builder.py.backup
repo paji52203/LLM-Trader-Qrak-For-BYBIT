@@ -257,25 +257,7 @@ class ContextBuilder:
 
                     data += f"{period_name}: {change_pct:.2f}% change | High: {high_formatted} | Low: {low_formatted}\n"
 
-        return data if data != "## Market Data\n" else ""
-
-    def build_macro_bias_section(self, h1_candles: Optional[np.ndarray], h4_candles: Optional[np.ndarray]) -> str:
-        """Build macro directional bias report from H1 and H4 candles."""
-        if h1_candles is None and h4_candles is None:
-            return ""
-
-        report = "## 🆕 UPGRADE: MACRO DIRECTIONAL BIAS (H1 & H4)\n"
-        
-        if h1_candles is not None and len(h1_candles) > 0:
-            last_h1 = h1_candles[-1]
-            report += f"- **1H Market Structure:** Last Close: ${float(last_h1[4]):,.2f} | High: ${float(last_h1[2]):,.2f} | Low: ${float(last_h1[3]):,.2f}\n"
-
-        if h4_candles is not None and len(h4_candles) > 0:
-            last_h4 = h4_candles[-1]
-            report += f"- **4H Market Structure:** Last Close: ${float(last_h4[4]):,.2f} | High: ${float(last_h4[2]):,.2f} | Low: ${float(last_h4[3]):,.2f}\n"
-
-        report += "- Use this data to determine the higher timeframe trend (BULL/BEAR/SIDEWAYS) before analyzing the 15m structure.\n"
-        return report
+        return data if data != "MARKET DATA:\n" else ""
 
     def build_market_period_metrics_section(self, market_metrics: Optional[Dict[str, Any]]) -> str:
         """Build market period metrics section.

@@ -179,11 +179,11 @@ class PromptBuilder:
         sections.extend([
             self.context_builder.build_market_data_section(context.ohlcv_candles),
             self.technical_analysis_formatter.format_technical_analysis(context, self.timeframe),
-            self.context_builder.build_macro_bias_section(
-                getattr(context, 'h1_candles', None), getattr(context, 'h4_candles', None)
-            ),
             self.context_builder.build_market_period_metrics_section(context.market_metrics),
         ])
+
+        if hasattr(context, 'mtf_alignment') and context.mtf_alignment and "N/A" not in context.mtf_alignment:
+            sections.append(f"## MULTI-TIMEFRAME ALIGNMENT\n{context.mtf_alignment}")
 
         # Add previous indicators comparison section if available
         if previous_indicators:

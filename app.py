@@ -26,7 +26,7 @@ from src.trading import (
 # Configuration Constants
 POSITION_UPDATE_INTERVAL = 3600  # 1 hour
 SLEEP_CHUNK_SIZE = 1.0  # Check for interruptions every second
-CANDLE_BUFFER_SECONDS = 2  # Seconds to wait after candle start
+CANDLE_BUFFER_SECONDS = 10  # Seconds to wait after candle start
 ERROR_WAIT_SHORT = 60   # Seconds to wait after minor error
 ERROR_WAIT_LONG = 300   # Seconds to wait after major error
 
@@ -43,7 +43,6 @@ class CryptoTradingBot:
         market_analyzer,
         trading_strategy,
         discord_notifier,
-        telegram_notifier,
         keyboard_handler,
         rag_engine,
         coingecko_api,
@@ -58,8 +57,7 @@ class CryptoTradingBot:
         statistics_service: TradingStatisticsService,
         memory_service: TradingMemoryService,
         dashboard_state = None,
-        discord_task: Optional[asyncio.Task] = None,
-        bybit_ws = None
+        discord_task: Optional[asyncio.Task] = None
     ):
         # pylint: disable=too-many-arguments, too-many-locals
         # Reason: Dependency Injection pattern requires all components to be injected.
@@ -77,7 +75,6 @@ class CryptoTradingBot:
         self.market_analyzer = market_analyzer
         self.trading_strategy = trading_strategy
         self.discord_notifier = discord_notifier
-        self.telegram_notifier = telegram_notifier
         self.keyboard_handler = keyboard_handler
         self.rag_engine = rag_engine
 
@@ -96,7 +93,6 @@ class CryptoTradingBot:
         self.statistics_service = statistics_service
         self.memory_service = memory_service
         self.dashboard_state = dashboard_state
-        self.bybit_ws = bybit_ws
 
         # Runtime state
         self.tasks = []
@@ -132,9 +128,6 @@ class CryptoTradingBot:
 
             if self.exchange_manager:
                 self.shutdown_manager.register_shutdown_callback(self.exchange_manager.shutdown)
-
-            if self.telegram_notifier:
-                self.shutdown_manager.register_shutdown_callback(self.telegram_notifier.close)
 
             if self.cryptocompare_session:
                 self.shutdown_manager.register_shutdown_callback(self.cryptocompare_session.close)
@@ -207,10 +200,6 @@ class CryptoTradingBot:
             return
 
         self.current_exchange = exchange
-        
-        # Check for manual overrides now that exchange is known
-        await self._check_manual_overrides()
-
         self.logger.info("Starting trading for %s on %s", symbol, exchange_id)
         self.logger.info("Timeframe: %s", self.current_timeframe)
 
@@ -230,7 +219,7 @@ class CryptoTradingBot:
             position = self.trading_strategy.current_position
             self.logger.info("Existing position: %s @ $%s", position.direction, f"{position.entry_price:,.2f}")
             # Start hourly position updates for existing position
-            if self.discord_notifier or self.telegram_notifier:
+            if self.discord_notifier:
                 await self._start_position_status_updates()
         else:
             self.logger.info("No existing position")
@@ -281,7 +270,6 @@ class CryptoTradingBot:
         self._log_check_header(check_count)
         
         current_ticker, current_price = await self._fetch_ticker_data()
-        await self.trading_strategy.sync_with_exchange(self.current_symbol)
         await self._check_position_status(current_price, is_candle_close=is_candle_close)
         await self._execute_market_knowledge_update(force_news_update)
         
@@ -297,10 +285,7 @@ class CryptoTradingBot:
         decision = await self.trading_strategy.process_analysis(result, self.current_symbol)
         
         if decision:
-            if self.discord_notifier:
-                await self.discord_notifier.send_trading_decision(decision, self.config.MAIN_CHANNEL_ID)
-            if self.telegram_notifier:
-                await self.telegram_notifier.send_trading_decision(decision)
+            await self.discord_notifier.send_trading_decision(decision, self.config.MAIN_CHANNEL_ID)
             await self._handle_new_position(decision, current_price)
         else:
             self.logger.info("No trading action taken")
@@ -351,12 +336,6 @@ class CryptoTradingBot:
                         trade_history=history,
                         symbol=self.current_symbol,
                         channel_id=self.config.MAIN_CHANNEL_ID
-                    )
-                if self.telegram_notifier:
-                    history = self.persistence.load_trade_history()
-                    await self.telegram_notifier.send_performance_stats(
-                        trade_history=history,
-                        symbol=self.current_symbol
                     )
         except Exception as e:
             self.logger.error("Error checking position: %s", e)
@@ -415,7 +394,7 @@ class CryptoTradingBot:
         if decision.action not in ('BUY', 'SELL') or not self.trading_strategy.current_position:
             return
         
-        if not self.discord_notifier and not self.telegram_notifier:
+        if not self.discord_notifier:
             return
         
         try:
@@ -423,17 +402,11 @@ class CryptoTradingBot:
                 ticker = await self._fetch_current_ticker()
                 current_price = float(ticker.get('last', ticker.get('close', 0))) if ticker else 0.0
             
-            if self.discord_notifier:
-                await self.discord_notifier.send_position_status(
-                    position=self.trading_strategy.current_position,
-                    current_price=current_price,
-                    channel_id=self.config.MAIN_CHANNEL_ID
-                )
-            if self.telegram_notifier:
-                await self.telegram_notifier.send_position_status(
-                    position=self.trading_strategy.current_position,
-                    current_price=current_price
-                )
+            await self.discord_notifier.send_position_status(
+                position=self.trading_strategy.current_position,
+                current_price=current_price,
+                channel_id=self.config.MAIN_CHANNEL_ID
+            )
         except Exception as e:
             self.logger.warning("Error sending initial position status: %s", e)
         
@@ -447,12 +420,6 @@ class CryptoTradingBot:
                 symbol=self.current_symbol,
                 timeframe=self.current_timeframe,
                 channel_id=self.config.MAIN_CHANNEL_ID
-            )
-        if self.telegram_notifier:
-            await self.telegram_notifier.send_analysis_notification(
-                result=result,
-                symbol=self.current_symbol,
-                timeframe=self.current_timeframe
             )
     
     def _save_analysis_data(self, result: Dict[str, Any]):
@@ -576,18 +543,6 @@ class CryptoTradingBot:
                 self.logger.info("Force analysis triggered - interrupting wait")
                 return True
 
-            # Real-time WebSocket Alarm Check!
-            if getattr(self, 'bybit_ws', None) and self.trading_strategy.current_position:
-                ws_price = self.bybit_ws.get_latest_price()
-                if ws_price:
-                    # Check if current websocket price trips local soft-stops
-                    close_reason = await self.trading_strategy.check_position(ws_price)
-                    if close_reason:
-                        self.logger.critical("🚨 WEBSOCKET ALARM TRIPPED! Market crossed %s at $%.2f. WAKING UP BOT!", close_reason.upper(), ws_price)
-                        if respect_force_analysis:
-                            self._force_analysis.clear()
-                            return True
-
             remaining = seconds - elapsed
             sleep_time = min(SLEEP_CHUNK_SIZE, remaining)
             await asyncio.sleep(sleep_time)
@@ -652,19 +607,6 @@ class CryptoTradingBot:
                         self.logger.debug("Sent hourly position status update to Discord")
                     except Exception as e:
                         self.logger.warning("Error sending position status update: %s", e)
-                
-                if self.telegram_notifier:
-                    try:
-                        ticker = await self._fetch_current_ticker()
-                        current_price = float(ticker.get('last', ticker.get('close', 0))) if ticker else 0.0
-
-                        await self.telegram_notifier.send_position_status(
-                            position=self.trading_strategy.current_position,
-                            current_price=current_price
-                        )
-                        self.logger.debug("Sent hourly position status update to Telegram")
-                    except Exception as e:
-                        self.logger.warning("Error sending telegram position status update: %s", e)
         except asyncio.CancelledError:
             self.logger.debug("Position status loop cancelled")
             raise
@@ -739,14 +681,11 @@ class CryptoTradingBot:
                     # changing interval doesn't require analyzer re-init, just sleep duration change
 
                 if changed:
-                    if self.current_exchange is not None:
-                        self.market_analyzer.initialize_for_symbol(
-                            symbol=self.current_symbol,
-                            exchange=self.current_exchange,
-                            timeframe=self.current_timeframe
-                        )
-                        self.logger.critical("Bot successfully applied overrides: %s @ %s", self.current_symbol, self.current_timeframe)
-                    else:
-                        self.logger.warning("Override change detected but exchange not yet ready — will retry next cycle.")
+                    self.market_analyzer.initialize_for_symbol(
+                        symbol=self.current_symbol,
+                        exchange=self.current_exchange,
+                        timeframe=self.current_timeframe
+                    )
+                    self.logger.critical("Bot successfully applied overrides: %s @ %s", self.current_symbol, self.current_timeframe)
         except Exception as e:
             self.logger.error("Error checking manual overrides: %s", e)

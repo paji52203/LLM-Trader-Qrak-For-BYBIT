@@ -24,6 +24,8 @@ class AnalysisContext(SerializableMixin):
     exchange: Optional[str] = None
     timeframe: Optional[str] = None
     ohlcv_candles: Optional[np.ndarray] = None
+    h1_candles: Optional[np.ndarray] = None
+    h4_candles: Optional[np.ndarray] = None
     current_price: Optional[float] = None
     timestamps: Optional[List[datetime]] = None
     technical_data: Dict[str, Any] = field(default_factory=dict)

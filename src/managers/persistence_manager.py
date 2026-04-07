@@ -62,46 +62,41 @@ class PersistenceManager:
             self._position_cache = position
             self._position_cache_valid = True
 
-            import threading
-            if not hasattr(self, '_pos_lock'):
-                self._pos_lock = threading.Lock()
-                
-            with self._pos_lock:
-                if position is None:
-                    if self.positions_file.exists():
-                        self.positions_file.unlink()
-                    return
+            if position is None:
+                if self.positions_file.exists():
+                    self.positions_file.unlink()
+                return
 
-                data = {
-                    "entry_price": position.entry_price,
-                    "stop_loss": position.stop_loss,
-                    "take_profit": position.take_profit,
-                    "size": position.size,
-                    "entry_time": position.entry_time.isoformat(),
-                    "confidence": position.confidence,
-                    "direction": position.direction,
-                    "symbol": position.symbol,
-                    "confluence_factors": [[name, score] for name, score in position.confluence_factors],
-                    "entry_fee": position.entry_fee,
-                    "size_pct": position.size_pct,
-                    "quote_amount": position.quote_amount,
-                    "atr_at_entry": position.atr_at_entry,
-                    "volatility_level": position.volatility_level,
-                    "sl_distance_pct": position.sl_distance_pct,
-                    "tp_distance_pct": position.tp_distance_pct,
-                    "rr_ratio_at_entry": position.rr_ratio_at_entry,
-                    "adx_at_entry": position.adx_at_entry,
-                    "rsi_at_entry": position.rsi_at_entry,
-                    "max_drawdown_pct": position.max_drawdown_pct,
-                    "max_profit_pct": position.max_profit_pct,
-                }
+            data = {
+                "entry_price": position.entry_price,
+                "stop_loss": position.stop_loss,
+                "take_profit": position.take_profit,
+                "size": position.size,
+                "entry_time": position.entry_time.isoformat(),
+                "confidence": position.confidence,
+                "direction": position.direction,
+                "symbol": position.symbol,
+                "confluence_factors": [[name, score] for name, score in position.confluence_factors],
+                "entry_fee": position.entry_fee,
+                "size_pct": position.size_pct,
+                "quote_amount": position.quote_amount,
+                "atr_at_entry": position.atr_at_entry,
+                "volatility_level": position.volatility_level,
+                "sl_distance_pct": position.sl_distance_pct,
+                "tp_distance_pct": position.tp_distance_pct,
+                "rr_ratio_at_entry": position.rr_ratio_at_entry,
+                "adx_at_entry": position.adx_at_entry,
+                "rsi_at_entry": position.rsi_at_entry,
+                "max_drawdown_pct": position.max_drawdown_pct,
+                "max_profit_pct": position.max_profit_pct,
+            }
 
-                data = serialize_for_json(data)
+            data = serialize_for_json(data)
 
-                temp_path = str(self.positions_file) + ".tmp"
-                with open(temp_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=2)
-                os.replace(temp_path, self.positions_file)
+            temp_path = str(self.positions_file) + ".tmp"
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            os.replace(temp_path, self.positions_file)
 
             self.logger.debug("Saved position: %s %s", position.direction, position.symbol)
         except Exception as e:
@@ -286,7 +281,24 @@ class PersistenceManager:
             prompt: The prompt that was sent to the AI
         """
         try:
-            response_dict = {"text_analysis": response}
+            # [🆕 UPGRADE: MICRO-MEMORY 3-CANDLE AGGREGATION]
+            old_data = self.load_previous_response()
+            old_response = old_data.get("response", "") if old_data else ""
+            
+            history_blocks = [r.strip() for r in old_response.split('\n---\n') if r.strip()]
+            
+            # Clean up the raw response (remove json block to save tokens, only keep reasoning)
+            reasoning_only = response.split('```json')[0].strip() if '```json' in response else response.strip()
+            
+            new_block = f"[{datetime.now(timezone.utc).strftime('%H:%M')}]: {reasoning_only}"
+            history_blocks.append(new_block)
+            
+            if len(history_blocks) > 3:
+                history_blocks = history_blocks[-3:]
+                
+            aggregated_response = "\n---\n".join(history_blocks)
+
+            response_dict = {"text_analysis": aggregated_response}
 
             if technical_data:
                 serialized_data = serialize_for_json(technical_data)
