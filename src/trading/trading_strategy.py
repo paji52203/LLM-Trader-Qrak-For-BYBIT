@@ -447,44 +447,17 @@ class TradingStrategy:
                         return None
 
                 order = None
-                if exchange_id == "bybit" and self.price_provider:
-                    # IMPLEMENTASI MARKETABLE LIMIT ORDER UNTUK BYBIT
-                    latest_ws_price = self.price_provider.get_latest_price()
-                    
-                    if latest_ws_price:
-                        # Gunakan harga dari WebSocket untuk mendapatkan Limit Price yang akurat
-                        # Berikan offset 0.05% agar order langsung terisi (marketable limit)
-                        offset_pct = 0.0005 # 0.05%
-                        
-                        if direction == "LONG":
-                            limit_price = latest_ws_price * (1 + offset_pct)
-                            self.logger.info(f"Using Bybit Marketable Limit BUY: WS Price ${latest_ws_price:,.2f} -> Limit ${limit_price:,.2f} (+0.05%)")
-                            order = await self.exchange_manager.create_limit_buy_order(
-                                exchange_id, symbol, quantity, limit_price
-                            )
-                        else:
-                            limit_price = latest_ws_price * (1 - offset_pct)
-                            self.logger.info(f"Using Bybit Marketable Limit SELL: WS Price ${latest_ws_price:,.2f} -> Limit ${limit_price:,.2f} (-0.05%)")
-                            order = await self.exchange_manager.create_limit_sell_order(
-                                exchange_id, symbol, quantity, limit_price
-                            )
-                    else:
-                        self.logger.warning("WebSocket price not available yet. Falling back to Market Order.")
-                        if direction == "LONG":
-                             order = await self.exchange_manager.create_market_buy_order(exchange_id, symbol, quantity)
-                        else:
-                             order = await self.exchange_manager.create_market_sell_order(exchange_id, symbol, quantity)
+                latest_ws_price = self.price_provider.get_latest_price() if (self.price_provider and exchange_id == "bybit") else None
+                leverage_to_use = int(risk_assessment.leverage) if hasattr(risk_assessment, "leverage") else 10
+
+                if direction == "LONG":
+                     order = await self.exchange_manager.create_futures_long(
+                         exchange_id, symbol, quantity, leverage=leverage_to_use, current_price=latest_ws_price
+                     )
                 else:
-                    # Standar Market Order untuk platform lain atau jika WS tidak ada
-                    if direction == "LONG":
-                         # Tokocrypto (spot) uses quote_amount, others use quantity
-                         quote_param = risk_assessment.quote_amount if exchange_id == "tokocrypto" else 0.0
-                         order = await self.exchange_manager.create_market_buy_order(
-                             exchange_id, symbol, quantity,
-                             quote_amount=quote_param
-                         )
-                    else:
-                         order = await self.exchange_manager.create_market_sell_order(exchange_id, symbol, quantity)
+                     order = await self.exchange_manager.create_futures_short(
+                         exchange_id, symbol, quantity, leverage=leverage_to_use, current_price=latest_ws_price
+                     )
                 
                 if order is None:
                      self.logger.warning("Live order rejected by exchange. Aborting local position creation.")
