@@ -153,6 +153,7 @@ class AnalysisEngine:
         self.context = AnalysisContext(symbol)
         self.context.exchange = exchange.name if exchange.name else str(exchange)
         self.context.timeframe = effective_timeframe
+        self.timeframe = effective_timeframe  # keep in sync to prevent fallback to config default
 
         # Create data fetcher via factory
         data_fetcher = self.data_fetcher_factory.create(exchange)
