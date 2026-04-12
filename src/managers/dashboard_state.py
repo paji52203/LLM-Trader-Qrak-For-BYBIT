@@ -21,6 +21,7 @@ class DashboardState:
     last_analysis_time: Optional[datetime] = None
     current_position: Optional[Dict[str, Any]] = None
     current_price: Optional[float] = None
+    current_capital: Optional[float] = None
     api_costs: Dict[str, float] = field(default_factory=lambda: {"openrouter": 0.0, "google": 0.0})
     last_request_cost: Optional[float] = None
     _cache: dict[str, Any] = field(default_factory=dict)
@@ -31,6 +32,12 @@ class DashboardState:
         """Update current price (no broadcast to avoid spam)."""
         async with self._lock:
             self.current_price = price
+
+    async def update_capital(self, capital: float) -> None:
+        """Update current capital (real exchange balance) and broadcast to clients."""
+        async with self._lock:
+            self.current_capital = capital
+        await self._broadcast({"type": "capital_update", "current_capital": capital})
 
     async def update_next_check(self, next_time: datetime) -> None:
         """Update next check time and broadcast to clients."""
@@ -80,6 +87,13 @@ class DashboardState:
         return {
             "next_check_utc": self.next_check_utc.isoformat(),
             "seconds_remaining": max(0, int(remaining))
+        }
+
+    def get_capital_data(self) -> Dict[str, Any]:
+        """Get current capital (real exchange balance) for REST API."""
+        return {
+            "current_capital": self.current_capital,
+            "formatted_capital": f"${self.current_capital:,.2f}" if self.current_capital else "N/A"
         }
 
     def get_cost_data(self) -> Dict[str, Any]:

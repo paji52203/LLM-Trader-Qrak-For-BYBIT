@@ -24,8 +24,6 @@ class BaseAgent:
             response = await self.model_manager.query_async(
                 prompt=prompt,
                 system_prompt=system_prompt,
-                temperature=temperature,
-                max_tokens=max_tokens
             )
             return {"success": True, "response": response}
         except Exception as e:

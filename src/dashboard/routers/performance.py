@@ -27,7 +27,7 @@ class PerformanceRouter:
 
     def _default_statistics(self) -> Dict[str, Any]:
         """Return a default statistics payload seeded from configured or manual capital."""
-        initial_capital = getattr(self.config, "DEMO_QUOTE_CAPITAL", 10000.0)
+        initial_capital = self.dashboard_state.current_capital if self.dashboard_state and self.dashboard_state.current_capital else getattr(self.config, "DEMO_QUOTE_CAPITAL", 10000.0)
         
         # Check for manual initial capital override
         try:

@@ -311,7 +311,7 @@ class CryptoTradingBot:
         )
 
         if agent_decision and agent_decision.get("success"):
-            self.logger.info(f"Agent system decision: {agent_decision['decision']} (confidence: {agent_decision['confidence']}%)")
+            self.logger.info(f"Agent system decision: {agent_decision['decision']} (confidence: {agent_decision['decision'].get('confidence', 50)}%)")
             # Merge agent decision into analysis result for trading strategy
             result["agent_decision"] = agent_decision
         else:

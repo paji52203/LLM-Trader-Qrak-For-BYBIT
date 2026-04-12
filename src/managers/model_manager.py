@@ -222,6 +222,34 @@ class ModelManager(ModelManagerProtocol):
             return provider_name, model_chain
         return provider_name, "unspecified"
 
+
+    async def query_async(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        model: str = None
+    ) -> str:
+        """Async query method for AI agents."""
+        try:
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            
+            effective_provider = self.provider
+            effective_model = model if model else self._orchestrator.resolve_model(effective_provider)
+            
+            result = await self._orchestrator.get_text_response(
+                effective_provider, 
+                messages, 
+                effective_model,
+            )
+            
+            return await self._process_result(result)
+        except Exception as e:
+            self.logger.error(f"query_async failed: {e}")
+            raise
+
     def _prepare_messages(self, prompt: str, system_message: Optional[str] = None) -> List[Dict[str, str]]:
         """Prepare message structure for API call."""
         self.token_counter.reset_session_stats()
